@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::{BTreeMap, VecDeque},
     mem,
     ops::{Bound, Index, IndexMut},
@@ -449,7 +448,96 @@ pub(super) struct Dedup {
 ///
 /// Because QUIC never reuses packet numbers, this only needs to be large enough to deal with
 /// packets that are reordered but still delivered in a timely manner.
-type Window = u128;
+///
+/// HAUL PATCH: was `u128` (129-packet window). Delivered-but-reordered packets falling more
+/// than the window behind the highest authenticated packet are discarded as "possible
+/// duplicates" — at Gbit rates ~1 ms of reordering already spans hundreds of packet numbers,
+/// which manifested as a spurious-loss/retransmit storm under path reordering
+/// (wan-test/results-realworld-2026-07-05.md). 2048 bits tolerates ~10 ms at ~200k pps for
+/// 240 extra bytes per connection.
+type Window = BigWindow;
+
+/// Number of `u64` words in [`BigWindow`] (2048 bits).
+const WINDOW_WORDS: usize = 32;
+
+/// Fixed 2048-bit window providing just the operations `Dedup` needs from the former `u128`.
+/// Bit 0 is the least significant bit of word 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BigWindow([u64; WINDOW_WORDS]);
+
+impl BigWindow {
+    const ZERO: Self = Self([0; WINDOW_WORDS]);
+    const BITS: u64 = (WINDOW_WORDS as u64) * 64;
+
+    /// `self << n`, saturating to all-zero when `n >= Self::BITS`
+    /// (mirrors `u128::checked_shl(..).unwrap_or(0)`)
+    fn shl(&self, n: u64) -> Self {
+        if n >= Self::BITS {
+            return Self::ZERO;
+        }
+        let (ws, bs) = ((n / 64) as usize, (n % 64) as u32);
+        let mut out = [0u64; WINDOW_WORDS];
+        for i in (ws..WINDOW_WORDS).rev() {
+            let lo = self.0[i - ws];
+            out[i] = if bs == 0 {
+                lo
+            } else {
+                let carry = if i > ws { self.0[i - ws - 1] >> (64 - bs) } else { 0 };
+                (lo << bs) | carry
+            };
+        }
+        Self(out)
+    }
+
+    fn get(&self, bit: u64) -> bool {
+        debug_assert!(bit < Self::BITS);
+        self.0[(bit / 64) as usize] & (1u64 << (bit % 64)) != 0
+    }
+
+    fn set(&mut self, bit: u64) {
+        debug_assert!(bit < Self::BITS);
+        self.0[(bit / 64) as usize] |= 1u64 << (bit % 64);
+    }
+
+    /// Test helper mirroring the former `u128` literal comparisons.
+    #[cfg(test)]
+    fn from_u128(v: u128) -> Self {
+        let mut w = Self::ZERO;
+        w.0[0] = v as u64;
+        w.0[1] = (v >> 64) as u64;
+        w
+    }
+
+    /// Position of the highest ZERO bit within `[lo, hi)` (`hi` clamped to `Self::BITS`),
+    /// or `None` if every bit in the range is set. Mirrors the former
+    /// `(!window & mask).leading_zeros()` gap scan.
+    fn highest_zero_in(&self, lo: u64, hi: u64) -> Option<u64> {
+        let hi = hi.min(Self::BITS);
+        if lo >= hi {
+            return None;
+        }
+        let (lo_w, hi_w) = ((lo / 64) as usize, ((hi - 1) / 64) as usize);
+        for w in (lo_w..=hi_w).rev() {
+            let mut gaps = !self.0[w];
+            if w == hi_w {
+                let top = (hi - 1) % 64; // highest in-range bit within this word
+                if top < 63 {
+                    gaps &= (1u64 << (top + 1)) - 1;
+                }
+            }
+            if w == lo_w {
+                let bottom = lo % 64;
+                if bottom > 0 {
+                    gaps &= !((1u64 << bottom) - 1);
+                }
+            }
+            if gaps != 0 {
+                return Some((w as u64) * 64 + 63 - gaps.leading_zeros() as u64);
+            }
+        }
+        None
+    }
+}
 
 /// Number of packets tracked by `Dedup`.
 const WINDOW_SIZE: u64 = 1 + mem::size_of::<Window>() as u64 * 8;
@@ -457,7 +545,7 @@ const WINDOW_SIZE: u64 = 1 + mem::size_of::<Window>() as u64 * 8;
 impl Dedup {
     /// Construct an empty window positioned at the start.
     pub(super) fn new() -> Self {
-        Self { window: 0, next: 0 }
+        Self { window: Window::ZERO, next: 0 }
     }
 
     /// Highest packet number authenticated.
@@ -471,18 +559,17 @@ impl Dedup {
     pub(super) fn insert(&mut self, packet: u64) -> bool {
         if let Some(diff) = packet.checked_sub(self.next) {
             // Right of window
-            self.window = ((self.window << 1) | 1)
-                .checked_shl(cmp::min(diff, u64::from(u32::MAX)) as u32)
-                .unwrap_or(0);
+            let mut shifted = self.window.shl(1);
+            shifted.set(0);
+            self.window = shifted.shl(diff); // saturates to zero past the window width
             self.next = packet + 1;
             false
         } else if self.highest() - packet < WINDOW_SIZE {
             // Within window
             if let Some(bit) = (self.highest() - packet).checked_sub(1) {
                 // < highest
-                let mask = 1 << bit;
-                let duplicate = self.window & mask != 0;
-                self.window |= mask;
+                let duplicate = self.window.get(bit);
+                self.window.set(bit);
                 duplicate
             } else {
                 // == highest
@@ -528,16 +615,12 @@ impl Dedup {
             return None;
         }
 
-        // Ensure the shift is within bounds (we already know start_offset < BITFIELD_SIZE,
-        // because of the early return)
-        let mask = if range_len == BITFIELD_SIZE {
-            u128::MAX
-        } else {
-            ((1u128 << range_len) - 1) << start_offset
-        };
-        let gaps = !self.window & mask;
-
-        let smallest_missing_offset = 128 - gaps.leading_zeros() as u64;
+        // Highest un-received offset within the window slice (the former
+        // `(!window & mask).leading_zeros()` scan); earlier packets are considered received.
+        let smallest_missing_offset = self
+            .window
+            .highest_zero_in(start_offset, start_offset + range_len)?
+            + 1;
         let smallest_missing_packet = self.highest() - smallest_missing_offset;
 
         if smallest_missing_packet <= upper_bound {
@@ -888,6 +971,10 @@ impl PacketNumberFilter {
 }
 
 /// Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare
+// NOTE (haul): under heavy reordering `insert_one`'s pop_min() past this cap discards
+// acknowledgment state for delivered packets (spurious peer retransmits). Left at 64 because
+// `Ack::encode` writes every stored range — raising this needs a fit-aware encoder. The
+// primary reordering fix is the wider `Dedup` window above.
 const MAX_ACK_BLOCKS: usize = 64;
 
 #[cfg(test)]
@@ -899,32 +986,32 @@ mod test {
         let mut dedup = Dedup::new();
         assert!(!dedup.insert(0));
         assert_eq!(dedup.next, 1);
-        assert_eq!(dedup.window, 0b1);
+        assert_eq!(dedup.window, BigWindow::from_u128(0b1));
         assert!(dedup.insert(0));
         assert_eq!(dedup.next, 1);
-        assert_eq!(dedup.window, 0b1);
+        assert_eq!(dedup.window, BigWindow::from_u128(0b1));
         assert!(!dedup.insert(1));
         assert_eq!(dedup.next, 2);
-        assert_eq!(dedup.window, 0b11);
+        assert_eq!(dedup.window, BigWindow::from_u128(0b11));
         assert!(!dedup.insert(2));
         assert_eq!(dedup.next, 3);
-        assert_eq!(dedup.window, 0b111);
+        assert_eq!(dedup.window, BigWindow::from_u128(0b111));
         assert!(!dedup.insert(4));
         assert_eq!(dedup.next, 5);
-        assert_eq!(dedup.window, 0b11110);
+        assert_eq!(dedup.window, BigWindow::from_u128(0b11110));
         assert!(!dedup.insert(7));
         assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_0100);
+        assert_eq!(dedup.window, BigWindow::from_u128(0b1111_0100));
         assert!(dedup.insert(4));
         assert!(!dedup.insert(3));
         assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_1100);
+        assert_eq!(dedup.window, BigWindow::from_u128(0b1111_1100));
         assert!(!dedup.insert(6));
         assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_1101);
+        assert_eq!(dedup.window, BigWindow::from_u128(0b1111_1101));
         assert!(!dedup.insert(5));
         assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_1111);
+        assert_eq!(dedup.window, BigWindow::from_u128(0b1111_1111));
     }
 
     #[test]
@@ -944,10 +1031,15 @@ mod test {
         dedup.insert(2 * WINDOW_SIZE);
         assert!(dedup.insert(WINDOW_SIZE));
         assert_eq!(dedup.next, 2 * WINDOW_SIZE + 1);
-        assert_eq!(dedup.window, 0);
+        assert_eq!(dedup.window, BigWindow::ZERO);
         assert!(!dedup.insert(WINDOW_SIZE + 1));
         assert_eq!(dedup.next, 2 * WINDOW_SIZE + 1);
-        assert_eq!(dedup.window, 1 << (WINDOW_SIZE - 2));
+        let expected = {
+            let mut w = BigWindow::ZERO;
+            w.set(WINDOW_SIZE - 2);
+            w
+        };
+        assert_eq!(dedup.window, expected);
     }
 
     #[test]
@@ -1005,15 +1097,21 @@ mod test {
         dedup.insert(2);
         assert_eq!(dedup.smallest_missing_in_interval(1, 7), Some(3));
 
+        // Window-width-dependent cases (were 300/500/372 for the 129-packet u128 window):
+        // b1 pushes the gap at 171 just outside the window, where packets are considered
+        // received; expected is the lowest packet still inside the window after b2.
         dedup.insert(170);
         dedup.insert(172);
-        dedup.insert(300);
+        let b1 = 171 + WINDOW_SIZE;
+        dedup.insert(b1);
         assert_eq!(dedup.smallest_missing_in_interval(170, 172), None);
 
-        dedup.insert(500);
-        assert_eq!(dedup.smallest_missing_in_interval(0, 500), Some(372));
-        assert_eq!(dedup.smallest_missing_in_interval(0, 373), Some(372));
-        assert_eq!(dedup.smallest_missing_in_interval(0, 372), None);
+        let b2 = b1 + 200;
+        dedup.insert(b2);
+        let expected = b2 - (WINDOW_SIZE - 1);
+        assert_eq!(dedup.smallest_missing_in_interval(0, b2), Some(expected));
+        assert_eq!(dedup.smallest_missing_in_interval(0, expected + 1), Some(expected));
+        assert_eq!(dedup.smallest_missing_in_interval(0, expected), None);
     }
 
     #[test]
