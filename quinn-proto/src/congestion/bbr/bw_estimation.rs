@@ -1,7 +1,14 @@
+use std::collections::VecDeque;
 use std::fmt::{Debug, Display, Formatter};
 
 use super::min_max::MinMax;
 use crate::{Duration, Instant};
+
+/// Snapshot spacing / retention for `delivered_history` (haul patch, below):
+/// ~4 ms grain × 256 entries ≈ the last second of delivery history, enough to
+/// look back one full RTT on any realistic WAN path.
+const HISTORY_GRAIN: Duration = Duration::from_millis(4);
+const HISTORY_LEN: usize = 256;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BandwidthEstimation {
@@ -15,6 +22,10 @@ pub(crate) struct BandwidthEstimation {
     prev_sent_time: Option<Instant>,
     max_filter: MinMax,
     acked_at_last_window: u64,
+    /// haul patch (see `on_ack`): (time, total_acked) snapshots ~4 ms apart
+    /// covering the last ~1 s, so an ack can be rated over the acked packet's
+    /// whole flight time instead of the gap since the previous ack event.
+    delivered_history: VecDeque<(Instant, u64)>,
 }
 
 impl BandwidthEstimation {
@@ -28,7 +39,7 @@ impl BandwidthEstimation {
     pub(crate) fn on_ack(
         &mut self,
         now: Instant,
-        _sent: Instant,
+        sent: Instant,
         bytes: u64,
         round: u64,
         app_limited: bool,
@@ -52,19 +63,59 @@ impl BandwidthEstimation {
             _ => u64::MAX, // will take the min of send and ack, so this is just a skip
         };
 
-        let ack_rate = match self.prev_acked_time {
-            Some(prev_acked_time) => Self::bw_from_delta(
-                self.total_acked - self.prev_total_acked,
-                now - prev_acked_time,
+        // haul patch — delivery-rate sample over the acked packet's FLIGHT
+        // time (draft-cheng-iccrg-delivery-rate-estimation), not the gap since
+        // the previous ack event. The upstream sample (this batch's bytes over
+        // the inter-ack gap) explodes under ack compression: when many
+        // connections share one receiver socket, ACKs arrive in bursts with
+        // microsecond gaps, the burst samples latch the max filter 10-30x
+        // above the real rate, and cwnd (= gain x bw x min_rtt) settles at
+        // 20-30x BDP -> ~60% sustained ensemble loss (measured, haul
+        // wan-test/results-autotune-2026-07-06.md). Rating over the flight
+        // time bounds the sample by what the path actually delivered in an
+        // RTT, which ack batching cannot inflate.
+        let delivered_at_send = self.delivered_before(sent);
+        let ack_rate = match now > sent {
+            true => Self::bw_from_delta(
+                self.total_acked.saturating_sub(delivered_at_send),
+                now - sent,
             )
             .unwrap_or(0),
-            None => 0,
+            false => 0,
         };
+
+        // Snapshot AFTER sampling, throttled to the history grain.
+        match self.delivered_history.back() {
+            Some(&(t, _)) if now.saturating_duration_since(t) < HISTORY_GRAIN => {}
+            _ => {
+                self.delivered_history.push_back((now, self.total_acked));
+                if self.delivered_history.len() > HISTORY_LEN {
+                    self.delivered_history.pop_front();
+                }
+            }
+        }
 
         let bandwidth = send_rate.min(ack_rate);
         if !app_limited && self.max_filter.get() < bandwidth {
             self.max_filter.update_max(round, bandwidth);
         }
+    }
+
+    /// haul patch: `total_acked` as of the newest snapshot at-or-before `t`.
+    /// Falls back to the oldest snapshot when history doesn't reach back to
+    /// `t` (short-lived underestimate — safe direction), and to 0 when empty
+    /// (connection start: everything delivered happened within this flight).
+    fn delivered_before(&self, t: Instant) -> u64 {
+        let mut best = None;
+        for &(ts, total) in &self.delivered_history {
+            if ts <= t {
+                best = Some(total);
+            } else {
+                break;
+            }
+        }
+        best.or_else(|| self.delivered_history.front().map(|&(_, total)| total))
+            .unwrap_or(0)
     }
 
     pub(crate) fn bytes_acked_this_window(&self) -> u64 {
