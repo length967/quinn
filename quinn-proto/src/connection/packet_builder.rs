@@ -202,6 +202,20 @@ impl PacketBuilder {
             false => 0,
         };
 
+        // haul patch: delivery-rate estimation
+        // (draft-cheng-iccrg-delivery-rate-estimation §3.2). If the pipe was
+        // empty, restart the flight epoch, then stamp the connection's
+        // delivery state into the packet for per-ack rate samples.
+        if size != 0 && conn.path.in_flight.bytes == 0 {
+            conn.delivery_rate.first_sent_time = Some(now);
+            conn.delivery_rate.delivered_time = Some(now);
+        }
+        let rate_stamp = conn.delivery_rate.stamp(
+            now,
+            conn.path.in_flight.bytes + u64::from(size),
+            conn.app_limited,
+        );
+
         let packet = SentPacket {
             path_generation: conn.path.generation(),
             largest_acked: sent.largest_acked,
@@ -210,6 +224,7 @@ impl PacketBuilder {
             ack_eliciting,
             retransmits: sent.retransmits,
             stream_frames: sent.stream_frames,
+            rate_stamp, // haul patch
         };
 
         conn.path

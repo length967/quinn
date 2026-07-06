@@ -1,15 +1,17 @@
 //! Logic for controlling the rate at which data is sent
 
-use crate::Instant;
 use crate::connection::RttEstimator;
+use crate::{Duration, Instant};
 use std::any::Any;
 use std::sync::Arc;
 
 mod bbr;
+mod bbr2; // haul patch: BBRv2 controller over the per-ack rate-sample plumbing
 mod cubic;
 mod new_reno;
 
 pub use bbr::{Bbr, BbrConfig};
+pub use bbr2::{Bbr2, Bbr2Config}; // haul patch
 pub use cubic::{Cubic, CubicConfig};
 pub use new_reno::{NewReno, NewRenoConfig};
 
@@ -59,6 +61,25 @@ pub trait Controller: Send + Sync {
         lost_bytes: u64,
     );
 
+    /// haul patch: a per-ack delivery-rate sample
+    /// (draft-cheng-iccrg-delivery-rate-estimation)
+    ///
+    /// Called once per newly acked ack-eliciting packet, alongside
+    /// [`Controller::on_ack`], with a sample computed from delivery state
+    /// stamped into the packet at send time. Default no-op so existing
+    /// controllers are unaffected.
+    #[allow(unused_variables)]
+    fn on_ack_sample(&mut self, now: Instant, sample: &RateSample) {}
+
+    /// haul patch: a per-loss-event sample
+    ///
+    /// Called once per packet declared lost (in packet-number order) with the
+    /// state stamped at that packet's send time. [`Self::on_congestion_event`]
+    /// is still delivered once per loss batch; this adds the per-packet
+    /// granularity BBRv2-style controllers need. Default no-op.
+    #[allow(unused_variables)]
+    fn on_loss_sample(&mut self, now: Instant, sample: &LossSample) {}
+
     /// The known MTU for the current network path has been updated
     fn on_mtu_update(&mut self, new_mtu: u16);
 
@@ -94,6 +115,52 @@ pub struct ControllerMetrics {
     pub ssthresh: Option<u64>,
     /// Pacing rate (bits/s)
     pub pacing_rate: Option<u64>,
+}
+
+/// haul patch: a per-ack delivery-rate sample
+/// (draft-cheng-iccrg-delivery-rate-estimation §3.3)
+///
+/// "C" refers to the connection's running delivery totals, "P" to the state
+/// stamped into the acked packet when it was sent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RateSample {
+    /// Bytes delivered between the acked packet's send and its ack
+    /// (`C.delivered - P.delivered`)
+    pub delivered: u64,
+    /// `C.delivered` when the acked packet was sent (`P.delivered`); round
+    /// counters compare this against a delivered-bytes round end
+    pub prior_delivered: u64,
+    /// The sampling interval: `max(send_elapsed, ack_elapsed)`
+    pub interval: Duration,
+    /// Bytes in flight when the acked packet was sent, including that packet
+    pub tx_in_flight: u64,
+    /// Bytes declared lost between the acked packet's send and its ack
+    /// (`C.lost - P.lost`)
+    pub lost: u64,
+    /// Whether the connection was app-limited when the acked packet was sent
+    pub is_app_limited: bool,
+    /// Bytes newly acked by this packet (the packet's size)
+    pub bytes_acked: u64,
+}
+
+/// haul patch: a per-loss-event sample (the data model of s2n-quic's
+/// `CongestionController::on_packet_lost`)
+#[derive(Debug, Clone, Copy)]
+pub struct LossSample {
+    /// Size in bytes of the lost packet
+    pub bytes: u64,
+    /// Bytes in flight when the lost packet was sent, including that packet
+    pub tx_in_flight: u64,
+    /// Bytes declared lost between the packet's send and its loss declaration,
+    /// including the packet itself (`C.lost - P.lost`)
+    pub lost: u64,
+    /// Total bytes delivered (`C.delivered`) when the loss was declared
+    pub delivered: u64,
+    /// Whether the connection was app-limited when the lost packet was sent
+    pub is_app_limited: bool,
+    /// Whether this packet starts a new loss burst (i.e. it is not contiguous
+    /// with the previously declared lost packet)
+    pub new_loss_burst: bool,
 }
 
 /// Constructs controllers on demand

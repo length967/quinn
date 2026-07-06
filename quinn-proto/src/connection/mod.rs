@@ -72,7 +72,10 @@ mod spaces;
 pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
 use spaces::Retransmits;
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
+use spaces::{
+    DeliveryRateState, PacketNumberFilter, PacketSpace, SendableFrames, SentPacket,
+    ThinRetransmits,
+};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
@@ -226,6 +229,11 @@ pub struct Connection {
     /// Whether the last `poll_transmit` call yielded no data because there was
     /// no outgoing application data.
     app_limited: bool,
+    /// haul patch: connection-level delivery-rate bookkeeping
+    /// (draft-cheng-iccrg-delivery-rate-estimation); stamped into sent packets
+    /// and sampled on ack/loss for
+    /// `congestion::Controller::{on_ack_sample, on_loss_sample}`.
+    delivery_rate: DeliveryRateState,
 
     streams: StreamsState,
     /// Surplus remote CIDs for future use on new paths
@@ -338,6 +346,7 @@ impl Connection {
             pto_count: 0,
 
             app_limited: false,
+            delivery_rate: DeliveryRateState::default(), // haul patch
             receiving_ecn: false,
             total_authed_packets: 0,
 
@@ -1589,6 +1598,29 @@ impl Connection {
                 self.app_limited,
                 &self.path.rtt,
             );
+            // haul patch: per-ack delivery-rate sample
+            // (draft-cheng-iccrg-delivery-rate-estimation §3.3): account the
+            // delivery, then sample over max(send_elapsed, ack_elapsed).
+            let stamp = info.rate_stamp;
+            self.delivery_rate.delivered += u64::from(info.size);
+            self.delivery_rate.delivered_time = Some(now);
+            self.delivery_rate.first_sent_time = Some(info.time_sent);
+            let send_elapsed = info
+                .time_sent
+                .saturating_duration_since(stamp.first_sent_time);
+            let ack_elapsed = now.saturating_duration_since(stamp.delivered_time);
+            self.path.congestion.on_ack_sample(
+                now,
+                &crate::congestion::RateSample {
+                    delivered: self.delivery_rate.delivered - stamp.delivered,
+                    prior_delivered: stamp.delivered,
+                    interval: send_elapsed.max(ack_elapsed),
+                    tx_in_flight: stamp.tx_in_flight,
+                    lost: self.delivery_rate.lost - stamp.lost,
+                    is_app_limited: stamp.is_app_limited,
+                    bytes_acked: u64::from(info.size),
+                },
+            );
         }
 
         // Update state for confirmed delivery of frames
@@ -1740,6 +1772,11 @@ impl Connection {
                 lost_packets, size_of_lost_packets
             );
 
+            // haul patch: per-loss-event samples for delivery-rate-aware
+            // controllers. A new loss burst starts when the lost packet is not
+            // contiguous with the previously declared lost packet (matching
+            // s2n-quic's recovery manager semantics).
+            let mut prev_lost_packet: Option<u64> = None;
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
                 self.config.qlog_sink.emit_packet_lost(
@@ -1751,6 +1788,26 @@ impl Connection {
                     self.orig_rem_cid,
                 );
                 self.remove_in_flight(&info);
+                if info.size != 0 {
+                    // haul patch (cont.): feed the loss into the connection
+                    // total, then sample it (C.lost includes this packet, as in
+                    // s2n-quic's on_packet_lost / BBRHandleLostPacket).
+                    self.delivery_rate.lost += u64::from(info.size);
+                    let new_loss_burst =
+                        prev_lost_packet.is_none_or(|prev| packet != prev.wrapping_add(1));
+                    prev_lost_packet = Some(packet);
+                    self.path.congestion.on_loss_sample(
+                        now,
+                        &crate::congestion::LossSample {
+                            bytes: u64::from(info.size),
+                            tx_in_flight: info.rate_stamp.tx_in_flight,
+                            lost: self.delivery_rate.lost - info.rate_stamp.lost,
+                            delivered: self.delivery_rate.delivered,
+                            is_app_limited: info.rate_stamp.is_app_limited,
+                            new_loss_burst,
+                        },
+                    );
+                }
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
                 }

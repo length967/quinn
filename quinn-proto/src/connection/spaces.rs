@@ -299,6 +299,61 @@ pub(super) struct SentPacket {
     ///
     /// The actual application data is stored with the stream state.
     pub(super) stream_frames: frame::StreamMetaVec,
+    /// haul patch: delivery-rate state captured at send time
+    /// (draft-cheng-iccrg-delivery-rate-estimation §3.2); consumed on ack/loss
+    /// to build the `RateSample`/`LossSample` passed to
+    /// `congestion::Controller::{on_ack_sample, on_loss_sample}`.
+    pub(super) rate_stamp: RateStamp,
+}
+
+/// haul patch: per-packet snapshot of the connection's delivery-rate state
+/// ("P" state in draft-cheng-iccrg-delivery-rate-estimation).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RateStamp {
+    /// C.delivered when this packet was sent
+    pub(super) delivered: u64,
+    /// C.delivered_time when this packet was sent
+    pub(super) delivered_time: Instant,
+    /// C.first_sent_time when this packet was sent
+    pub(super) first_sent_time: Instant,
+    /// Bytes in flight when this packet was sent, including this packet
+    pub(super) tx_in_flight: u64,
+    /// C.lost (total bytes declared lost) when this packet was sent
+    pub(super) lost: u64,
+    /// Whether the connection was app-limited when this packet was sent
+    pub(super) is_app_limited: bool,
+}
+
+/// haul patch: connection-level delivery-rate bookkeeping
+/// ("C" state in draft-cheng-iccrg-delivery-rate-estimation §2.2).
+#[derive(Debug, Default, Clone)]
+pub(super) struct DeliveryRateState {
+    /// Total bytes delivered (acked for the first time) over the connection
+    pub(super) delivered: u64,
+    /// Time of the most recent delivery-state update (`None` until first send)
+    pub(super) delivered_time: Option<Instant>,
+    /// Send time of the first packet of the current flight epoch
+    pub(super) first_sent_time: Option<Instant>,
+    /// Total bytes declared lost over the connection
+    pub(super) lost: u64,
+}
+
+impl DeliveryRateState {
+    /// Stamp a packet at send time (draft §3.2)
+    ///
+    /// `tx_in_flight` must include the packet being stamped. Both times fall
+    /// back to `now`, which is only observable for the first packet of a
+    /// connection (where the draft initializes them to the send time anyway).
+    pub(super) fn stamp(&self, now: Instant, tx_in_flight: u64, app_limited: bool) -> RateStamp {
+        RateStamp {
+            delivered: self.delivered,
+            delivered_time: self.delivered_time.unwrap_or(now),
+            first_sent_time: self.first_sent_time.unwrap_or(now),
+            tx_in_flight,
+            lost: self.lost,
+            is_app_limited: app_limited,
+        }
+    }
 }
 
 /// Retransmittable data queue
@@ -1181,6 +1236,8 @@ mod test {
     fn sent_packet_size() {
         // The tracking state of sent packets should be minimal, and not grow
         // over time.
-        assert!(std::mem::size_of::<SentPacket>() <= 128);
+        // haul patch: bound raised from 128 for the `rate_stamp` delivery-rate
+        // fields (documented, accepted memory cost).
+        assert!(std::mem::size_of::<SentPacket>() <= 192);
     }
 }
