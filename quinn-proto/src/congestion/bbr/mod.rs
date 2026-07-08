@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering}; // haul WS-2 governor window-cap handle
 
 use rand::{Rng, SeedableRng};
 
@@ -24,6 +25,8 @@ mod min_max;
 #[derive(Debug, Clone)]
 pub struct Bbr {
     config: Arc<BbrConfig>,
+    /// haul WS-2 governor: shared per-stripe window cap (bytes/sec, 0 = uncapped).
+    max_rate: Arc<AtomicU64>,
     current_mtu: u64,
     max_bandwidth: BandwidthEstimation,
     acked_bytes: u64,
@@ -64,6 +67,7 @@ impl Bbr {
     pub fn new(config: Arc<BbrConfig>, current_mtu: u16) -> Self {
         let initial_window = config.initial_window;
         Self {
+            max_rate: config.max_rate.clone(), // before `config` is moved below
             config,
             current_mtu: current_mtu as u64,
             max_bandwidth: BandwidthEstimation::default(),
@@ -482,12 +486,14 @@ impl Controller for Bbr {
     }
 
     fn window(&self) -> u64 {
-        if self.mode == Mode::ProbeRtt {
-            return self.get_probe_rtt_cwnd();
+        let base = if self.mode == Mode::ProbeRtt {
+            self.get_probe_rtt_cwnd()
         } else if self.recovery_state.in_recovery() && self.mode != Mode::Startup {
-            return self.cwnd.min(self.recovery_window);
-        }
-        self.cwnd
+            self.cwnd.min(self.recovery_window)
+        } else {
+            self.cwnd
+        };
+        self.cap_window(base)
     }
 
     fn metrics(&self) -> ControllerMetrics {
@@ -511,10 +517,35 @@ impl Controller for Bbr {
     }
 }
 
+impl Bbr {
+    /// haul WS-2 governor: clamp the congestion window to the governor's
+    /// per-stripe rate cap (`max_rate × min_rtt` — the BDP at the capped rate),
+    /// never below `min_cwnd`. Because quinn paces at `window()/rtt` and limits
+    /// in-flight to `window()`, this bounds new + retransmit bytes together and
+    /// the send rate — the lever the app-rate limiter lacked (PLAN-011 §RESULT).
+    /// Inert when the handle is 0 (the default), so the validated path is
+    /// byte-for-byte unchanged unless the governor engages.
+    fn cap_window(&self, w: u64) -> u64 {
+        let max_rate = self.max_rate.load(Ordering::Relaxed);
+        if max_rate == 0 {
+            return w;
+        }
+        let rtt = self.min_rtt.as_secs_f64();
+        if rtt <= 0.0 {
+            return w; // no RTT sample yet — cannot size a BDP cap
+        }
+        let cap = ((max_rate as f64 * rtt) as u64).max(self.min_cwnd);
+        w.min(cap)
+    }
+}
+
 /// Configuration for the [`Bbr`] congestion controller
 #[derive(Debug, Clone)]
 pub struct BbrConfig {
     initial_window: u64,
+    /// haul WS-2 governor: shared window-cap handle (bytes/sec, 0 = uncapped);
+    /// controllers built from this config read it each `window()`.
+    max_rate: Arc<AtomicU64>,
 }
 
 impl BbrConfig {
@@ -525,12 +556,21 @@ impl BbrConfig {
         self.initial_window = value;
         self
     }
+
+    /// haul WS-2 governor: share the per-stripe window-cap handle into this
+    /// config's controllers. Storing a non-zero bytes/sec value caps the window;
+    /// 0 (the default) leaves BBR unchanged.
+    pub fn max_rate_handle(&mut self, handle: Arc<AtomicU64>) -> &mut Self {
+        self.max_rate = handle;
+        self
+    }
 }
 
 impl Default for BbrConfig {
     fn default() -> Self {
         Self {
             initial_window: K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE,
+            max_rate: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -648,3 +688,48 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
+
+#[cfg(test)]
+mod haul_governor_tests {
+    // haul WS-2: the window cap (`cap_window`, driven by `BbrConfig::max_rate_handle`)
+    // clamps `window()` to `max_rate × min_rtt`, never below `min_cwnd`, and is
+    // inert at 0. Regression guard for the vendor patch (PLAN-011c); mirror to the
+    // length967/quinn fork alongside the rest of the diff.
+    use super::*;
+
+    fn bbr_with_cap(handle: Arc<AtomicU64>, min_rtt: Duration, cwnd: u64) -> Bbr {
+        let mut cfg = BbrConfig::default();
+        cfg.max_rate_handle(handle);
+        let mut b = Bbr::new(Arc::new(cfg), 1452);
+        b.min_rtt = min_rtt;
+        b.cwnd = cwnd;
+        b
+    }
+
+    #[test]
+    fn cap_is_inert_at_zero() {
+        let b = bbr_with_cap(Arc::new(AtomicU64::new(0)), Duration::from_millis(100), 50_000_000);
+        assert_eq!(b.window(), 50_000_000, "handle 0 must not change window()");
+    }
+
+    #[test]
+    fn cap_clamps_to_rate_times_min_rtt() {
+        let h = Arc::new(AtomicU64::new(0));
+        let b = bbr_with_cap(h.clone(), Duration::from_millis(100), 50_000_000);
+        h.store(10_000_000, Ordering::Relaxed); // 10 MB/s × 0.1 s = 1_000_000 bytes
+        assert_eq!(b.window(), 1_000_000, "window must cap to max_rate × min_rtt");
+    }
+
+    #[test]
+    fn cap_never_below_min_cwnd() {
+        let h = Arc::new(AtomicU64::new(1)); // 1 B/s × 0.1 s ≈ 0 → floor kicks in
+        let b = bbr_with_cap(h, Duration::from_millis(100), 50_000_000);
+        assert_eq!(b.window(), b.min_cwnd, "cap must not stall the connection");
+    }
+
+    #[test]
+    fn cap_uncapped_before_first_rtt_sample() {
+        let b = bbr_with_cap(Arc::new(AtomicU64::new(10_000_000)), Duration::default(), 50_000_000);
+        assert_eq!(b.window(), 50_000_000, "min_rtt 0 (no sample yet) must stay uncapped");
+    }
+}
